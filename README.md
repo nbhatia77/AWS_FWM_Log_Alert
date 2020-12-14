@@ -8,6 +8,9 @@ AWS Firewall Manager with central Logging and Alerting
 1. Please make sure all AWS Firewall Manager prerequisites are met.
 
 ## Show the environments.
+1. Build attacker system and get it's public IP using:
+
+   'dig +short myip.opendns.com @resolver1.opendns.com'
 
 ## Attack Scenarios
 
