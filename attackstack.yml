@@ -1,0 +1,427 @@
+---
+## Nitin's AB3 Web Stack
+##
+## Changelog:
+##  - Initial release
+##
+## Dependencies:
+## WAF Systems Manager
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Attacksys Demo
+
+## Parameters
+Parameters:
+  EC2InstanceSize:
+    Default: "t2.small"
+    Description: Instance size for Web Servers.
+    Type: String
+    AllowedValues:
+      - "t2.small"
+      - "t2.medium"
+      - "t3.small"
+      - "t3.medium"
+  MyTrustedNetwork:
+    Description: Only connections from this network are allowed to your site. Enter an IP or CIDR E.g. 10.10.10.10/32. Get your current IP @ https://ifconfig.co/
+    AllowedPattern: "(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})"
+    Type: String
+    Default: 0.0.0.0/0
+  ArtifactsBucket:
+    Description: S3 bucket with artifact files (Lambda functions, templates, html files, etc.). Leave default.
+    Type: String
+    Default: nb-attack-sys
+    AllowedPattern: ^[0-9a-zA-Z]+([0-9a-zA-Z-]*[0-9a-zA-Z])*$
+    ConstraintDescription: ArtifactsBucket S3 bucket name can include numbers, lowercase letters, uppercase letters, and hyphens (-).
+      It cannot start or end with a hyphen (-).
+  ArtifactsPrefix:
+    Description: Path in the S3 bucket containing artifact files. Leave default.
+    Type: String
+    Default: private
+    AllowedPattern: ^[0-9a-zA-Z-/]*$
+    ConstraintDescription: ArtifactsPrefix key prefix can include numbers, lowercase letters, uppercase letters, hyphens (-),
+      and forward slash (/). Leave default.
+  AMIPreviousVersionIndex:
+    Description: Number of previous version of AMI to use [0=current AMI through 15]
+    Type: Number
+    Default: 5
+    MinValue: 0
+    MaxValue: 15
+  AlbDNSName:
+    Default: "http://NB-AB3-Alb-1SG67NHFLBPMU-729243526.us-east-1.elb.amazonaws.com"
+    Description: Instance size for Web Servers.
+    Type: String
+
+
+#  AmazonLinux2AmiId:
+#    Type : 'AWS::SSM::Parameter::Value<String>'
+#    Description: Latest Amazon Linux 2 AMI ID. Leave default.
+#    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+
+## Metadata
+Metadata:
+
+## Friendly UI grouping for parameters
+#        - AmazonLinux2AmiId
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Instance Configuration
+        Parameters:
+        - EC2InstanceSize
+        - MyTrustedNetwork
+        - AMIPreviousVersionIndex
+      - Label:
+          default: Artifact Configuration
+        Parameters:
+        - ArtifactsBucket
+        - ArtifactsPrefix
+
+    ParameterLabels:
+      EC2InstanceSize:
+        default: EC2 Instance Size
+      MyTrustedNetwork:
+        default: Trusted Network CIDR
+      ArtifactsBucket:
+        default: S3 artifact bucket
+      ArtifactsPrefix:
+        default: S3 artifact path
+
+## Resources
+Resources:
+
+## The VPC
+  vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+      CidrBlock: !Sub 10.10.0.0/16
+      Tags:
+        - Key: Name
+          Value: !Join ["-" , [!Ref 'AWS::StackName', vpc]]
+
+## Create an IGW & attach it to the VPC
+  vpcIgw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Join ["-" , [!Ref 'AWS::StackName', Igw]]
+  attachIgwVpc:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref vpc
+      InternetGatewayId: !Ref vpcIgw
+
+## Create a public subnet in each AZ
+  sub1Public:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref vpc
+      CidrBlock: !Sub 10.10.1.0/24
+      AvailabilityZone: !Select 
+        - 0
+        - !GetAZs 
+          Ref: 'AWS::Region'
+      MapPublicIpOnLaunch: false
+      Tags:
+      Tags:
+        - Key: Name
+          Value: !Join ["-" , [!Ref 'AWS::StackName', PubSub1]]
+  
+## Associate the public subnets with a public route table
+  rtbPublic:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref vpc
+      Tags:
+        - Key: Name
+          Value: !Join ["-" , [!Ref 'AWS::StackName', PubRoutes]]
+  rteToIgw:
+    Type: AWS::EC2::Route
+    DependsOn: attachIgwVpc
+    Properties:
+      RouteTableId: !Ref rtbPublic
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref vpcIgw
+  srta1Public:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref sub1Public
+      RouteTableId: !Ref rtbPublic
+  
+## Create a private subnet in each AZ
+  sub1Private:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref vpc
+      CidrBlock: !Sub 10.10.11.0/24
+      AvailabilityZone: !Select 
+        - 0
+        - !GetAZs 
+          Ref: 'AWS::Region'
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Join ["-" , [!Ref 'AWS::StackName', PrvSub1]]
+  
+## Create a NAT Gateway & EIP
+  natEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+  vpcNgw:
+    Type: AWS::EC2::NatGateway
+    DependsOn: attachIgwVpc
+    Properties:
+      AllocationId: !GetAtt natEip.AllocationId
+      SubnetId: !Ref sub1Public
+      Tags:
+        - Key: Name
+          Value: !Join ["-" , [!Ref 'AWS::StackName', Ngw]]
+
+## Associate the private subnets with a natted route table
+  rtbNat:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref vpc
+      Tags:
+        - Key: Name
+          Value: !Join ["-" , [!Ref 'AWS::StackName', NgwRoutes]]
+  rteToNgw:
+    Type: AWS::EC2::Route
+    DependsOn: vpcNgw
+    Properties:
+      RouteTableId: !Ref rtbNat
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref vpcNgw
+  srta1Ngw:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref sub1Private
+      RouteTableId: !Ref rtbNat
+
+## Configure the security group
+  sgEC2Sg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref vpc
+      GroupDescription: EC2 Instance Security Group
+      Tags:
+        - Key: Name
+          Value: !Join ["-" , [!Ref 'AWS::StackName', EC2Sg]]
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 0
+          ToPort: 65535
+          
+
+##  Configure the EC2 IAM role along with supporting resources
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ["-" , [!Ref 'AWS::StackName', EC2Role]]
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - "sts:AssumeRole"
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+                - "ssm.amazonaws.com"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+      Policies:
+        - PolicyName: inline-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: [ "cloudwatch:GetMetricStatistics" ]
+                Resource: "*"
+              -
+                Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                  - "logs:DescribeLogStreams"
+                Resource: "arn:aws:logs:*:*:*"
+              -
+                Action:
+                  - s3:ListBucket
+                Effect: Allow
+                Resource:
+                  - !Join ['', ['arn:aws:s3:::', !Ref 'ArtifactsBucket']]
+              -
+                Action:
+                  - s3:GetObject
+                Effect: Allow
+                Resource:
+                  - !Join ['', ['arn:aws:s3:::', !Ref 'ArtifactsBucket', /, !Ref 'ArtifactsPrefix', /*]]
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+      - Ref: EC2InstanceRole
+
+  AMILambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: arn:aws:logs:*:*:*
+          - Effect: Allow
+            Action:
+            - ec2:DescribeImages
+            Resource: "*"
+
+# AMIInfoFunction - Look up an AMI based on a NameFilter
+#
+# This AWS Lambda function is used to look up an Amazon EC2 AMI based
+# on a name filter. An example of a name filter would be:
+#
+# amzn2-ami-hvm\*ebs
+#
+# After looking up the names of all images that satify the filter,
+# they are sorted in reverse by date/time stamp and the first AMI
+# ID (which corresponds to the newest AMI) is returned.
+#
+# Using a Lambda function makes it possible to look up the AMI
+# dynamically.  THe alternative would be to create a static map.
+
+  AMIInfoFunction:
+    Type: AWS::Lambda::Function
+    Properties: 
+      Description: "Look up an AMI based on a filter"
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt AMILambdaExecutionRole.Arn
+      Runtime: "python3.6"
+      Timeout: 30
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          import cfnresponse
+          def handler(event, context):
+            if event['RequestType'] == 'Delete':
+              responseData = {}      
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+              return
+            
+            ec2=boto3.client('ec2')
+            imageDescriptions=ec2.describe_images(
+              Owners=['amazon'],
+              Filters=[
+                {'Name': 'name', 'Values': [event['ResourceProperties']['NameFilter']]}, 
+                {'Name': 'architecture', 'Values': ['x86_64']}
+              ],
+            )
+            
+            numImageDescriptions = len(imageDescriptions['Images'])
+            if numImageDescriptions < 2:
+              responseData = {}
+              cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
+            else:
+              amiNames = sorted(imageDescriptions['Images'],
+                key=lambda x: x['CreationDate'],
+                reverse=True)
+              responseData = {}
+              responseData['Id'] = amiNames[${AMIPreviousVersionIndex}]['ImageId']
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+            return
+
+# AMIInfo - The AWS Lambda-backed resource for looking up an Amazon EC2 AMI
+#
+# Parameters
+#
+# ServiceToken - a pointer to the AWS Lambda function
+# NameFilter - the name filter to pass to the describe_images API
+
+  AMIInfo:
+    Type: Custom::AMIInfo
+    Properties:
+      ServiceToken: !GetAtt AMIInfoFunction.Arn
+      NameFilter: 'amzn2-ami-hvm*gp2'
+
+  RedTeamHost:
+      Type: AWS::EC2::Instance
+      Metadata:
+        AWS::CloudFormation::Init:
+          configSets:
+              Scanner_Install:
+                - configure_scanner
+          configure_scanner:
+            commands:
+              download:
+                cwd: /usr/bin
+                command: "cd /usr/bin; curl -O https://s3.amazonaws.com/protecting-workloads-workshop/public/artifacts/scanner.py"
+              addtargetcmd:
+                env:
+                  SCANTARG: !Join ['', ['http://', !Ref AlbDNSName]]
+                cwd: /usr/bin
+                command: "echo python3 /usr/bin/scanner.py \"$SCANTARG\" > /usr/bin/runscanner; chmod 755 /usr/bin/runscanner"
+      Properties:
+        ImageId:
+          !GetAtt AMIInfo.Id
+        InstanceType: !Ref EC2InstanceSize
+        IamInstanceProfile:
+          Ref: EC2InstanceProfile
+        SubnetId:
+              Ref: sub1Private          
+        Tags:
+        - Key: Name
+          Value: !Join ["-" , [!Ref 'AWS::StackName', RedTeamHost]]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            # yum update -y
+            yum install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm
+            amazon-linux-extras install -y python3 
+            yum install -y curl git python-pip httpie
+            /usr/bin/aws configure set region ${AWS::Region}
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource RedTeamHost --configsets Scanner_Install --region ${AWS::Region}
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource RedTeamHost --region ${AWS::Region}
+      CreationPolicy:
+        ResourceSignal:
+          Timeout: PT15M
+
+
+# End of changes for running first Inspector scan automatically
+
+Outputs:
+  cfnVersion:
+    Value: 4
+  accountId:
+    Description: AWS account number
+    Value: !Ref AWS::AccountId
+  Region:
+    Description: AWS Region
+    Value: !Ref AWS::Region
+  RedTeamHostSession:
+    Description: Start interactive shell on Red Team Host
+    Value: !Join ['', ['https://console.aws.amazon.com/systems-manager/session-manager/', !Ref RedTeamHost, '?', !Ref 'AWS::Region']]

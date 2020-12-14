@@ -1,0 +1,684 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Create IPSet, RuleGroup and Firewall Manager Policy. Firewall Policy contains two AWS managed rule groups and one custom rule group.
+Parameters:
+  BlockIpAddressCIDR:
+    Type: CommaDelimitedList
+    Description: "Enter IP Address range by using CIDR notation separated by comma to block incoming traffic originating from them. For eg: To specify the IPV4 address 192.0.2.44 type 192.0.2.44/32 or 10.0.2.0/24"
+  AWSAccountIds:
+    Type: CommaDelimitedList
+    Description: "Enter AWS Account IDs separated by comma in which you want to apply Firewall Manager policy"
+  SenderAccountNumber:
+    Type: String
+
+Resources:
+  WAFIPSetFMS:
+      Type: AWS::WAFv2::IPSet
+      Properties:
+        Description: Block ranges of IP addresses using this IP Set
+        Name: WAFIPSetFMS
+        Scope: REGIONAL
+        IPAddressVersion: IPV4	
+        Addresses: !Ref BlockIpAddressCIDR
+  RuleGroupXssFMS:
+    Type: AWS::WAFv2::RuleGroup
+    DependsOn: WAFIPSetFMS
+    Properties: 
+      Capacity: 500
+      Description: AWS WAF Rule Group to block web requests that contain cross site scripting injection attacks and originate from specific IP ranges.
+      Name: RuleGroupXssFMS
+      Scope: REGIONAL
+      VisibilityConfig:
+          SampledRequestsEnabled: true
+          CloudWatchMetricsEnabled: true
+          MetricName: RuleGroupXssFMS
+      Rules: 
+        - Name: xssException
+          Priority: 0
+          Action:
+            Block: {}
+          VisibilityConfig:
+              SampledRequestsEnabled: true
+              CloudWatchMetricsEnabled: true
+              MetricName: xssException
+          Statement:
+            AndStatement:
+              Statements:
+              - XssMatchStatement:
+                  FieldToMatch:
+                    Body: {}
+                  TextTransformations:
+                  - Type: HTML_ENTITY_DECODE
+                    Priority: 0
+                  - Type: LOWERCASE
+                    Priority: 1
+              - IPSetReferenceStatement:
+                  Arn: !GetAtt WAFIPSetFMS.Arn
+  PolicyWAFv2:
+    Type: AWS::FMS::Policy
+    Properties:
+      ExcludeResourceTags: false
+      PolicyName: WAF-Policy
+      IncludeMap: 
+        ACCOUNT: !Ref AWSAccountIds
+      RemediationEnabled: true
+      ResourceType: AWS::ElasticLoadBalancingV2::LoadBalancer 
+      SecurityServicePolicyData: 
+        Type: WAFV2
+        ManagedServiceData: !Sub '{"type":"WAFV2", 
+                                  "preProcessRuleGroups":[{ 
+                                  "ruleGroupType":"RuleGroup",
+                                  "ruleGroupArn":"${RuleGroupXssFMS.Arn}",
+                                  "overrideAction":{"type":"NONE"}},{
+                                  "managedRuleGroupIdentifier":{
+                                  "managedRuleGroupName":"AWSManagedRulesCommonRuleSet", 
+                                  "vendorName":"AWS"},
+                                  "overrideAction":{"type":"COUNT"}, 
+                                  "excludeRules":[],"ruleGroupType":"ManagedRuleGroup"},{
+                                  "managedRuleGroupIdentifier":{
+                                  "managedRuleGroupName":"AWSManagedRulesSQLiRuleSet", 
+                                  "vendorName":"AWS"},
+                                  "overrideAction":{"type":"NONE"}, 
+                                  "excludeRules":[],"ruleGroupType":"ManagedRuleGroup"}],
+                                  "postProcessRuleGroups":[],
+                                  "defaultAction":{"type":"ALLOW"}}'
+                                  # Add Firehose ARN for Logging
+
+# Kinesis Application
+  rWAFKinesisAnalyticsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - kinesisanalytics.amazonaws.com
+          Action: sts:AssumeRole
+      Path: "/"
+      RoleName: WAFKinesisAnalyticsRole
+
+
+  rWAFKinesisAnalyticsPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: KinesisAnalyticsPolicy
+      Roles:
+        - !Ref rWAFKinesisAnalyticsRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'lambda:InvokeFunction'
+              - 'lambda:GetFunctionConfiguration'
+            Resource: !GetAtt rLambdaReader.Arn
+          - Effect: Allow
+            Action:
+              - 'firehose:*'
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+            Resource: '*'
+
+  rKinesisAppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      RetentionInDays: 5
+
+  rKinesisAppLogStream:
+    Type: AWS::Logs::LogStream
+    Properties: 
+      LogGroupName: !Ref rKinesisAppLogGroup
+      LogStreamName: WAFKAlogstream
+
+  rKinesisApplication:
+    Type: AWS::KinesisAnalytics::Application
+    Properties:
+      ApplicationName: WAFApplication
+      ApplicationDescription: used by WAF Threat Intel CF
+      Inputs:
+        - NamePrefix: WAF
+          InputSchema:
+            RecordColumns:
+              - Name: COL_timestamp
+                SqlType: BIGINT
+                Mapping: $.timestamp
+              - Name: formatVersion
+                SqlType: INTEGER
+                Mapping: $.formatVersion
+              - Name: webaclid
+                SqlType: VARCHAR(128)
+                Mapping: $.webaclid
+              - Name: terminatingRuleId
+                SqlType: VARCHAR(32)
+                Mapping: $.terminatingRuleId
+              - Name: terminatingRuleType
+                SqlType: VARCHAR(32)
+                Mapping: $.terminatingRuleType
+              - Name: action
+                SqlType: VARCHAR(8)
+                Mapping: $.action
+              - Name: terminatingRuleMatchDetails
+                SqlType: VARCHAR(1024)
+                Mapping: $.terminatingRuleMatchDetails[0:]
+              - Name: httpSourceName
+                SqlType: VARCHAR(4)
+                Mapping: $.httpSourceName
+              - Name: httpSourceId
+                SqlType: VARCHAR(16)
+                Mapping: $.httpSourceId
+              - Name: ruleGroupList
+                SqlType: VARCHAR(1024)
+                Mapping: $.ruleGroupList[0:]
+              - Name: rateBasedRuleList
+                SqlType: VARCHAR(1024)
+                Mapping: $.rateBasedRuleList[0:]
+              - Name: nonTerminatingMatchingRules
+                SqlType: VARCHAR(1024)
+                Mapping: $.nonTerminatingMatchingRules[0:]
+              - Name: clientIp
+                SqlType: VARCHAR(16)
+                Mapping: $.httpRequest.clientIp
+              - Name: country
+                SqlType: VARCHAR(4)
+                Mapping: $.httpRequest.country
+              - Name: name
+                SqlType: VARCHAR(16)
+                Mapping: $.httpRequest.headers[0:].name
+              - Name: COL_value
+                SqlType: VARCHAR(128)
+                Mapping: $.httpRequest.headers[0:].value
+              - Name: uri
+                SqlType: VARCHAR(16)
+                Mapping: $.httpRequest.uri
+              - Name: args
+                SqlType: VARCHAR(16)
+                Mapping: $.httpRequest.args
+              - Name: httpVersion
+                SqlType: VARCHAR(16)
+                Mapping: $.httpRequest.httpVersion
+              - Name: httpMethod
+                SqlType: VARCHAR(16)
+                Mapping: $.httpRequest.httpMethod
+            RecordFormat:
+              RecordFormatType: JSON
+              MappingParameters:
+                JSONMappingParameters:
+                  RecordRowPath: $
+          KinesisFirehoseInput:
+            ResourceARN: !GetAtt rfirehoseStream.Arn
+            RoleARN: !GetAtt rWAFKinesisAnalyticsRole.Arn
+      ApplicationCode: "CREATE OR REPLACE STREAM \"wafstream\" (\n \"clientIp\" VARCHAR(16),\n \"action\" VARCHAR(8),\n \"time_stamp\" TIMESTAMP\n \n );\n\nCREATE OR REPLACE PUMP \"WAFPUMP\" as\nINSERT INTO \"wafstream\" (\n\"clientIp\",\n\"action\",\n\"time_stamp\"\n) \nSelect STREAM DISTINCT \"clientIp\", \"action\", FLOOR(WAF_001.ROWTIME TO MINUTE) as \"time_stamp\"\nFROM \"WAF_001\"\nWHERE \"action\" = 'BLOCK';"
+  rKinesisAppOutput:
+    Type: AWS::KinesisAnalytics::ApplicationOutput
+    Properties:
+      ApplicationName: !Ref rKinesisApplication
+      Output:
+        Name: wafstream
+        DestinationSchema:
+          RecordFormatType: "JSON"
+        LambdaOutput:
+          ResourceARN: !GetAtt rLambdaReader.Arn
+          RoleARN: !GetAtt rWAFKinesisAnalyticsRole.Arn
+
+#EventBridge
+  rEventBusAlertingRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - events.amazonaws.com
+            Action: sts:AssumeRole
+        Path: "/"
+        RoleName: EventBusAlertingRole
+
+
+  rEventBusAlertingPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: EventBusAlertingPolicy
+      Roles:
+        - !Ref rEventBusAlertingRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'events:PutEvents'
+              - 'lambda:InvokeFunction'
+              - 'lambda:GetFunctionConfiguration'
+            Resource: !GetAtt rLambdaWAFUpdater.Arn
+            
+  rReceiverEventBus:
+      Type: AWS::Events::EventBus
+      Properties:
+        Name: WAFUpdateEventBus
+
+  rEBPolicy:
+    Type: AWS::Events::EventBusPolicy
+    Properties: 
+      Action: 'events:PutEvents'
+      EventBusName: !GetAtt rReceiverEventBus.Name
+      Principal: !Ref SenderAccountNumber
+      StatementId: 'WAFExample'
+
+  rReceiverEBRule:
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: Rule to send WAF events to the Receiver account
+      EventBusName: !GetAtt rReceiverEventBus.Name
+      EventPattern: '{"source":["custom.waflogs"]}'
+      Name: waf-updating-rule
+      State: ENABLED
+      Targets: 
+        - Arn: !GetAtt rLambdaWAFUpdater.Arn
+          Id: waf-fupdating-rule
+
+  rEBLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties: 
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt rLambdaWAFUpdater.Arn
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt rReceiverEBRule.Arn
+
+#S3
+  rs3Bucket:
+    DeletionPolicy: Delete
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+#IAM fore firehose
+  rfirehoseDeliveryPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: firehose-delivery-policy
+      Roles:
+        - !Ref rFirehoseDeliveryRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 's3:AbortMultipartUpload'
+              - 's3:GetBucketLocation'
+              - 's3:GetObject'
+              - 's3:ListBucket'
+              - 's3:ListBucketMultipartUploads'
+              - 's3:PutObject'
+            Resource: 
+              - !Join ['', ['arn:aws:s3:::', !Ref 'rs3Bucket',  '/*']]
+              - !GetAtt rs3Bucket.Arn
+ 
+      
+  rFirehoseDeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - firehose.amazonaws.com
+          Action: sts:AssumeRole
+      Path: "/"
+      RoleName: firehose-delivery-role
+
+#Firehose
+  rfirehoseStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: "aws-waf-logs-waf-example"
+      DeliveryStreamType: DirectPut
+      S3DestinationConfiguration:
+        BucketARN: !GetAtt rs3Bucket.Arn
+        BufferingHints:
+          IntervalInSeconds: 300
+          SizeInMBs: 5
+        CompressionFormat: UNCOMPRESSED
+        CloudWatchLoggingOptions:
+          Enabled: False
+        RoleARN: !GetAtt rFirehoseDeliveryRole.Arn
+
+#IAM for waf logging
+  rWAFKinesisLoggingPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: WAF-Logging-Policy
+      Roles:
+        - !Ref rWAFFirehoseRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'firehose:PutRecord'
+              - 'firehost:PutRecordBatch'
+            Resource: !GetAtt rfirehoseStream.Arn
+         
+
+  rWAFFirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - wafv2.amazonaws.com
+          Action: sts:AssumeRole
+      Path: "/"
+      RoleName: WAFKinesisLoggingRole
+    
+  #Lambda
+  rLambdaKinesisReaderRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action: sts:AssumeRole
+        Path: "/"
+        RoleName: LambdaKinesisReaderRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+
+  rLambdaKinesisReaderPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: LambdaKinesisReaderPolicy
+      Roles:
+        - !Ref rLambdaKinesisReaderRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'events:DescribeEventBus'
+              - 'events:PutTargets'
+              - 'events:PutEvents'
+              - 'events:TestEventPattern'
+            Resource: !GetAtt rReceiverEventBus.Arn
+
+  rLambdaReader:
+    Type: AWS::Lambda::Function
+    Properties: 
+      Role: !GetAtt rLambdaKinesisReaderRole.Arn
+      Runtime: python3.7
+      Timeout: 120
+      MemorySize: 128
+      Handler: index.lambda_handler
+      Environment:
+        Variables:
+          eb_name: !GetAtt rReceiverEventBus.Name
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import base64
+          import os
+          eb_client = boto3.client('events')
+
+          def entry_maker(json_event):
+              this = {}
+              this["Source"] = "custom.waflogs"
+              this["Resources"] = ["WAFLogs"]
+              this["DetailType"] = "WAF Blocked IP"
+              print(str(json_event))
+              this["Detail"] = json_event.decode("utf-8")
+              this["EventBusName"] = os.environ["eb_name"]
+              return this
+
+          def lambda_handler(event, context):
+              json_event = event
+              records = json_event["records"]
+              entries = []
+              for record in records:
+                  if len(entries) == 10:
+                      eb_client.put_events(Entries=entries)
+                      entries[:] = []
+                  data = record["data"]
+                  decoded_data = base64.b64decode(data)
+                  entry = entry_maker(decoded_data)
+                  entries.append(entry)
+
+              try:
+                response = eb_client.put_events(Entries=entries)
+                print(response)
+              except Exception as e:
+                  print(e)
+            
+
+              return
+
+#custom resource
+  rCustomResourceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Path: "/"
+      RoleName: CustomResourceRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+
+  rCustomResourcePolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: CustomResourcePolicy
+      Roles:
+        - !Ref rCustomResourceRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'wafv2:ListWebACLs'
+              - 'wafv2:GetLoggingConfiguration'
+              - 'kinesisanalytics:ListApplications'
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - 'kinesisanalytics:StopApplication'
+              - 'kinesisanalytics:UpdateApplication'
+              - 'kinesisanalytics:GetApplicationState'
+              - 'kinesisanalytics:DescribeApplication'
+              - 'kinesisanalytics:StartApplication'
+            Resource: !Sub 'arn:aws:kinesisanalytics:*:*:application/*'
+          - Effect: Allow
+            Action:
+              - 'iam:CreateServiceLinkedRole'
+              - 'wafv2:PutLoggingConfiguration'
+              - 'wafv2:GetWebACL'
+            Resource:
+              - 'arn:aws:iam::*:role/*'
+              - 'arn:aws:wafv2::*:webacl/*'
+              - '*'
+
+  rLambdaCustomResource:
+    Type: AWS::Lambda::Function
+    Properties: 
+      Role: !GetAtt rCustomResourceRole.Arn
+      Runtime: python3.7
+      Timeout: 120
+      MemorySize: 128
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import cfnresponse
+
+          def lambda_handler(event, context):
+            if event["RequestType"] == "Delete":
+              responsedata = {"Data": "OK"}
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responsedata)
+              return
+              
+            #get vars
+            try:
+              kinesis_application = event['ResourceProperties']['KinesisApplicationName']
+              log_stream = event['ResourceProperties']['Logstream']
+              kinesis_role_arn = event['ResourceProperties']['KAArn']
+              webacl = event['ResourceProperties']['WEBACLArn']
+              firehose = event['ResourceProperties']['FirehoseArn']
+            except Exception as e:
+              responsedata = {"Data": "error getting variables"}
+              print(e)
+              cfnresponse.send(event, context, cfnresponse.FAILED, responsedata)
+              return
+            #kinesis
+            try:
+              kinesis_client =  boto3.client('kinesisanalytics')
+              describe = kinesis_client.describe_application(ApplicationName=kinesis_application)
+              input_conf = [{"Id":describe["ApplicationDetail"]["InputDescriptions"][0]["InputId"],"InputStartingPositionConfiguration":{"InputStartingPosition":"NOW"}}]
+              ka_version = describe["ApplicationDetail"]["ApplicationVersionId"]
+              kinesis_response = kinesis_client.start_application(ApplicationName=kinesis_application, InputConfigurations=input_conf)
+            except Exception as e:
+              responsedata = {"Data": "error configuring kinesis app"}
+              print(e)
+              cfnresponse.send(event, context, cfnresponse.FAILED, responsedata)
+              return
+            print(kinesis_response)
+            #waf 
+            try:
+              waf_client = boto3.client('wafv2')
+              logging_config = {"ResourceArn": webacl, "LogDestinationConfigs":[firehose]}
+              waf_response = waf_client.put_logging_configuration(LoggingConfiguration=logging_config)
+              print(waf_response)
+              responsedata = {"Data": "OK"}
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responsedata)
+              return
+            except Exception as e:
+              responsedata = {"Data": "error configuring waf logging"}
+              print(e)
+              cfnresponse.send(event, context, cfnresponse.FAILED, responsedata)
+              return
+              
+  # START MANUALLY, IF ERROR
+  #cStartApp:
+  #  Type: Custom::StartApp
+  #  Properties:
+  #    ServiceToken: !GetAtt rLambdaCustomResource.Arn
+  #    KinesisApplicationName: !Ref rKinesisApplication
+  #    Logstream: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${rKinesisAppLogGroup}:log-stream:${rKinesisAppLogStream}'
+  #    KAArn: !GetAtt rWAFKinesisAnalyticsRole.Arn
+  #    WEBACLArn: !GetAtt PolicyWAFv2.Arn  # From FWM
+  #    FirehoseArn: !GetAtt rfirehoseStream.Arn
+
+#Lambda Block IP
+  rLambdaWAFUpdaterRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action: sts:AssumeRole
+        Path: "/"
+        RoleName: LambdaWAFUpdaterRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+
+  rLambdaWAFUpdaterPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: WAFLambdaKinesisReaderPolicy
+      Roles:
+        - !Ref rLambdaWAFUpdaterRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: # Add FWM permissions
+              - 'wafv2:GetIPSet'
+              - 'wafv2:GetWebACL'
+              - 'wafv2:ListIPSets'
+              - 'wafv2:ListResourcesForWebACL'
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - 'wafv2:UpdateIPSet'
+            Resource: 
+              - !GetAtt PolicyWAFv2.Arn
+              - !GetAtt WAFIPSetFMS.Arn 
+
+  rLambdaWAFUpdater:
+    Type: AWS::Lambda::Function
+    Properties: 
+      Role: !GetAtt rLambdaWAFUpdaterRole.Arn
+      Runtime: python3.7
+      Timeout: 120
+      MemorySize: 128
+      Handler: index.lambda_handler
+      Environment:
+        Variables:
+          SCOPE: "REGIONAL"
+          IP_SET_ID: !GetAtt WAFIPSetFMS.Id
+          IP_SET_NAME: !Select [0, !Split ["|", !Ref WAFIPSetFMS]]
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+
+          client = boto3.client('wafv2')
+
+          def add_ip_to_ip_set(scope,ip_set_name,ip_set_id,ip_to_add):
+            response = client.get_ip_set(Name=ip_set_name, Scope=scope, Id=ip_set_id)
+            addresses = response["IPSet"]["Addresses"]
+            lock_token = response["LockToken"]
+
+            if ip_to_add in addresses:
+                return "AlreadyPresent"
+            else:
+                addresses.append(ip_to_add)
+                do_add_ip_to_ip_set(scope=scope,ip_set_name=ip_set_name,ip_to_add=addresses,lock_token=lock_token,ip_set_id=ip_set_id)
+
+          def do_add_ip_to_ip_set(scope,ip_set_name,ip_to_add,lock_token,ip_set_id):
+              response = client.update_ip_set(Name=ip_set_name,LockToken=lock_token,Id=ip_set_id,Scope=scope,Addresses=ip_to_add)
+            
+
+          def lambda_handler(event,context):
+            ip_address = event["detail"]["clientIp"] + "/32"
+            ipset_id = os.environ.get("IP_SET_ID")
+            ipset_name = os.environ.get("IP_SET_NAME")
+            scope = os.environ.get("SCOPE")
+            add_ip_to_ip_set(scope=scope, ip_set_id=ipset_id, ip_set_name=ipset_name, ip_to_add=ip_address)
+
+
+Outputs:
+ oLogStream:
+   Value: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${rKinesisAppLogGroup}:log-stream:${rKinesisAppLogStream}'
+ oKinesisRoleArn:
+    Value: !GetAtt rWAFKinesisAnalyticsRole.Arn
+
